@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs e saídas do bot
+*.log
+oportunidades_*.xlsx
+
+# Steam .maFile — contém credenciais 2FA, NUNCA comitar.
+maFiles/
+*.maFile
+*.mafile
+mafile*.json
+
+# Variáveis de ambiente e segredos
+.env
+.env.local
+secrets/
