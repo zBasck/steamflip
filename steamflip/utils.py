@@ -137,6 +137,14 @@ def rate_limit(segundos: float) -> None:
         time.sleep(segundos)
 
 
+async def rate_limit_async(segundos: float) -> None:
+    """Versao assincrona de rate_limit para uso com pysteamauth."""
+    import asyncio
+
+    if segundos > 0:
+        await asyncio.sleep(segundos)
+
+
 def em_partes(itens: Iterable[T], tamanho: int) -> Iterable[list[T]]:
     """Quebra uma coleção em lotes de tamanho fixo."""
     lote: list[T] = []

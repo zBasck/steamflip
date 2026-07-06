@@ -1,6 +1,7 @@
-"""Pipeline de execução: coleta -> análise -> geração do Excel.
+"""Pipeline de execução assíncrona: login -> coleta -> análise -> Excel.
 
-Separado de main.py para manter main.py focado em parsing de CLI.
+Usa o cliente autenticado do pysteamauth (igual os arquivos de referência)
+para destravar /pricehistory/ e /priceoverview/.
 """
 
 from __future__ import annotations
@@ -11,14 +12,8 @@ from pathlib import Path
 import pandas as pd
 
 from .analise import ResultadoAnalise, analisar_item
+from .auth import AuthError, fazer_login
 from .config import Execucao, JOGOS
-from .mafile import (
-    MaFile,
-    MaFileError,
-    carregar_mafile,
-    montar_cookies,
-    session_expirada,
-)
 from .mercado import (
     MercadoError,
     listar_itens_populares,
@@ -27,13 +22,13 @@ from .mercado import (
     resolver_currency,
 )
 from .relatorio import AbaRelatorio, gerar_excel
-from .utils import criar_sessao, rate_limit
+from .utils import configurar_logging
 
 LOG = logging.getLogger("steamflip")
 
 
-def _processar_item(
-    sessao,
+async def _processar_item(
+    client,
     appid: int,
     hash_name: str,
     preco_atual_hint: float,
@@ -41,17 +36,15 @@ def _processar_item(
     execucao: Execucao,
 ) -> tuple[pd.DataFrame, float]:
     """Coleta histórico e preço atual. Retorna (df, preco_atual)."""
-    df = obter_historico(
-        sessao,
+    df = await obter_historico(
+        client,
         appid,
         hash_name,
         currency=moeda,
         rate=execucao.rate_limit_segundos,
     )
-    # preço atual: prefere o lowest da priceoverview, mas se já veio no
-    # resultado de populares com valor, usa como fallback.
-    preco_lowest, _ = obter_preco_atual(
-        sessao,
+    preco_lowest, _ = await obter_preco_atual(
+        client,
         appid,
         hash_name,
         currency=moeda,
@@ -89,44 +82,14 @@ def _log_decisao_item(jogo: str, i: int, total: int, item, resultado) -> None:
     )
 
 
-def _carregar_sessao(execucao: Execucao) -> tuple[object, MaFile | None]:
-    """Cria a sessão HTTP, autenticada se houver maFile."""
-    mafile: MaFile | None = None
-    cookies: dict[str, str] | None = None
+async def executar_pipeline(execucao: Execucao) -> Path:
+    """Roda o pipeline completo (login + coleta + análise) e devolve o
+    caminho do Excel gerado."""
+    try:
+        client = await fazer_login()
+    except AuthError as exc:
+        raise MercadoError(f"Falha no login: {exc}") from exc
 
-    if execucao.mafile_path:
-        try:
-            mafile = carregar_mafile(execucao.mafile_path)
-        except MaFileError as exc:
-            raise MercadoError(f"Falha ao carregar maFile: {exc}") from exc
-
-        if session_expirada(mafile):
-            raise MercadoError(
-                f"Sessão Steam para '{mafile.account_name}' está expirada ou "
-                f"inválida. Abra o SDA, clique 'Login Again' na conta, salve o "
-                f"maFile e rode o bot de novo."
-            )
-
-        cookies = montar_cookies(mafile)
-        sessao = criar_sessao(cookies=cookies)
-        LOG.info(
-            "✓ maFile carregado: %s (SteamID %s) — modo autenticado.",
-            mafile.account_name,
-            mafile.steam_id_mascarado(),
-        )
-    else:
-        sessao = criar_sessao()
-        LOG.warning(
-            "Rodando SEM login (--mafile não informado). "
-            "/pricehistory/ e /priceoverview/ podem retornar HTTP 400."
-        )
-
-    return sessao, mafile
-
-
-def executar_pipeline(execucao: Execucao) -> Path:
-    """Roda o pipeline completo e devolve o caminho do Excel gerado."""
-    sessao, _mafile = _carregar_sessao(execucao)
     currency = resolver_currency(execucao.moeda)
     abas: list[AbaRelatorio] = []
 
@@ -136,8 +99,8 @@ def executar_pipeline(execucao: Execucao) -> Path:
         LOG.info("=== %s (appid=%s) ===", info["nome"], appid)
 
         try:
-            populares = listar_itens_populares(
-                sessao,
+            populares = await listar_itens_populares(
+                client,
                 appid,
                 limite=execucao.top,
                 currency=currency,
@@ -153,8 +116,8 @@ def executar_pipeline(execucao: Execucao) -> Path:
         total = len(populares)
         for i, item in enumerate(populares, start=1):
             try:
-                df, preco = _processar_item(
-                    sessao,
+                df, preco = await _processar_item(
+                    client,
                     appid,
                     item.market_hash_name,
                     item.preco_lowest,

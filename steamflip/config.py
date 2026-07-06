@@ -1,12 +1,27 @@
 """Configuração e parâmetros do projeto.
 
+Este arquivo é o template padrão commitado no repositório. Ele contém
+APENAS PLACEHOLDERS para as credenciais Steam. Para uso real, copie este
+arquivo para ``config_local.py`` e preencha com suas credenciais:
+
+    cp steamflip/config.py steamflip/config_local.py
+    # edite config_local.py com seu usuário, senha e caminho do maFile
+
+O ``.gitignore`` blinda ``config_local.py`` e ``maFiles/``.
+
 Todos os valores aqui podem ser sobrescritos via flags de CLI (ver main.py).
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
+
+# === Credenciais Steam (PLACEHOLDERS — substitua em config_local.py) ===
+STEAM_USERNAME = "seu_usuario_aqui"
+STEAM_PASSWORD = "sua_senha_aqui"
+MAFILE_PATH = os.path.join("maFiles", "sua_conta.maFile")
 
 # Mapeamento de apelidos amigáveis -> appid Steam.
 JOGOS: dict[str, dict[str, Any]] = {
@@ -94,8 +109,6 @@ class Execucao:
     criterios: Criterios = field(default_factory=Criterios)
     saida: str | None = None
     verbose: bool = False
-    # Caminho para um .maFile SDA. Se None, roda sem login.
-    mafile_path: str | None = None
 
     def validar(self) -> None:
         if not self.jogos:
@@ -120,13 +133,4 @@ class Execucao:
         if not (0 < self.criterios.percentil_max < 1):
             raise ValueError("percentil_max deve estar entre 0 e 1.")
         if self.pagina_tamanho < 1 or self.pagina_tamanho > 100:
-            # O mercado público trava em 10 sem cookie de login, então
-            # valores > 10 não fazem diferença prática — aceitamos para
-            # compatibilidade, mas o cliente força o mínimo.
             raise ValueError("--pagina-tamanho deve estar entre 1 e 100.")
-        if self.mafile_path is not None:
-            from pathlib import Path
-            if not Path(self.mafile_path).is_file():
-                raise ValueError(
-                    f"maFile não encontrado: {self.mafile_path}"
-                )

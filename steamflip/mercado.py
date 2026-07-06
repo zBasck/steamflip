@@ -1,7 +1,11 @@
-"""Cliente HTTP para os endpoints públicos do mercado Steam.
+"""Cliente HTTP autenticado para o mercado Steam (pysteamauth).
 
-Não usa autenticação. Cada função retorna dados normalizados ou levanta
-MercadoError em caso de falha.
+O ``pysteamauth.Steam`` mantém cookies de sessão após o login, então as
+chamadas para ``/search/render/``, ``/pricehistory/`` e ``/priceoverview/``
+funcionam autenticadas — sem o HTTP 400 do mercado público anônimo.
+
+Todas as funções são ``async`` e devolvem os dados normalizados ou
+levantam ``MercadoError`` em caso de falha.
 """
 
 from __future__ import annotations
@@ -9,25 +13,21 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Iterator
+from typing import AsyncIterator
 
 import pandas as pd
-import requests
 
 from .config import MOEDAS
 from .utils import (
-    criar_sessao,
     parse_preco_steam,
     parse_timestamp_steam,
-    rate_limit,
+    rate_limit_async,
     url_listing,
 )
 
 LOG = logging.getLogger("steamflip")
 
 BASE_URL = "https://steamcommunity.com/market"
-
-# URL alternativa de search (algumas instâncias CDN retornam HTML).
 SEARCH_URL = "https://steamcommunity.com/market/search/render/"
 
 
@@ -49,42 +49,68 @@ class ItemPopular:
     preco_median: float  # median price atual
 
 
-def _get_json(
-    sessao: requests.Session,
-    url: str,
-    params: dict,
-    timeout: float = 30.0,
-) -> dict | list:
-    """Faz GET e devolve o JSON decodificado. Levanta MercadoError se a
-    resposta não for JSON válido."""
+async def _request_json(client, url: str, params: dict | None = None) -> dict | list:
+    """Faz GET autenticado via pysteamauth e devolve o JSON decodificado.
+
+    pysteamauth devolve um dict/list se a resposta for JSON, ou string/bytes
+    se for HTML. Aqui nós aceitamos ambos e convertemos.
+    """
     try:
-        resp = sessao.get(url, params=params, timeout=timeout)
-    except requests.RequestException as exc:
+        resp = await client.request(url=url, method="GET", params=params or {})
+    except Exception as exc:  # noqa: BLE001
         raise MercadoError(f"Falha HTTP em {url}: {exc}") from exc
 
-    if resp.status_code != 200:
-        raise MercadoError(
-            f"Status {resp.status_code} em {url} (params={params})"
-        )
+    # pysteamauth pode devolver string (JSON) ou bytes.
+    if isinstance(resp, (bytes, bytearray)):
+        try:
+            texto = resp.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            raise MercadoError(f"Resposta binária inválida em {url}")
+        if not texto.strip():
+            raise MercadoError(f"Resposta vazia em {url}")
+        if texto.lstrip()[:200].lower().startswith(("<!doctype", "<html")):
+            raise MercadoError(
+                f"Resposta HTML em {url} (provável erro/rate limit)."
+            )
+        try:
+            return json.loads(texto)
+        except json.JSONDecodeError as exc:
+            raise MercadoError(f"JSON inválido em {url}: {exc}") from exc
 
-    texto = resp.text
-    if not texto:
-        raise MercadoError(f"Resposta vazia em {url}")
+    if isinstance(resp, str):
+        if not resp.strip():
+            raise MercadoError(f"Resposta vazia em {url}")
+        head = resp.lstrip()[:200].lower()
+        if head.startswith(("<!doctype", "<html")):
+            raise MercadoError(
+                f"Resposta HTML em {url} (provável erro/rate limit)."
+            )
+        try:
+            return json.loads(resp)
+        except json.JSONDecodeError as exc:
+            raise MercadoError(f"JSON inválido em {url}: {exc}") from exc
 
-    # Às vezes o endpoint devolve HTML de erro (rate limit, manutenção).
-    head = texto.lstrip()[:200].lower()
-    if head.startswith("<!doctype") or head.startswith("<html"):
-        raise MercadoError(
-            f"Resposta HTML em {url} (provável rate limit). "
-            f"Status {resp.status_code}."
-        )
+    if isinstance(resp, (dict, list)):
+        return resp
 
+    raise MercadoError(
+        f"Tipo inesperado de resposta em {url}: {type(resp).__name__}"
+    )
+
+
+async def _request_text(client, url: str, params: dict | None = None) -> str:
+    """GET autenticado devolvendo o corpo como string (HTML ou texto)."""
     try:
-        return json.loads(texto)
-    except json.JSONDecodeError as exc:
-        raise MercadoError(f"JSON inválido em {url}: {exc}") from exc
-
-
+        resp = await client.request(url=url, method="GET", params=params or {})
+    except Exception as exc:  # noqa: BLE001
+        raise MercadoError(f"Falha HTTP em {url}: {exc}") from exc
+    if isinstance(resp, (bytes, bytearray)):
+        return resp.decode("utf-8", errors="ignore")
+    if isinstance(resp, str):
+        return resp
+    raise MercadoError(
+        f"Tipo inesperado de resposta em {url}: {type(resp).__name__}"
+    )
 
 
 # Categorias aceitas pelo endpoint /search/render/. Apenas CS2 (appid 730)
@@ -100,19 +126,13 @@ _CATEGORIAS_CS2 = (
 
 
 def _categorias_para_appid(appid: int) -> dict[str, str]:
-    """Devolve os parâmetros de categoria aceitos para o appid informado.
-
-    Para CS2 (730), inclui os filtros de categoria que o mercado usa para
-    skins/cases/stickers. Para qualquer outro appid, devolve {} (a Steam
-    rejeita esses parâmetros com HTTP 400).
-    """
     if appid == 730:
         return {chave: "" for chave in _CATEGORIAS_CS2}
     return {}
 
 
-def listar_itens_populares(
-    sessao: requests.Session,
+async def listar_itens_populares(
+    client,
     appid: int,
     *,
     limite: int = 1000,
@@ -121,16 +141,10 @@ def listar_itens_populares(
     rate: float = 1.5,
 ) -> list[ItemPopular]:
     """Lista os itens mais populares de um app por volume/quantidade de
-    listagens ativas (proxy de popularidade). Faz paginação até atingir
-    `limite` ou não haver mais resultados.
+    listagens ativas (proxy de popularidade).
 
-    Observação: o endpoint público do mercado Steam trava ``pagesize`` em
-    10 quando não há cookie de sessão autenticado, ignorando o valor de
-    ``count`` enviado. Por isso o default aqui é 10 e o avanço de página
-    é de 10 em 10. O parâmetro ``pagina_tamanho`` é mantido por
-    compatibilidade, mas é forçado para o mínimo entre o valor pedido e
-    10 — o que garante que ``start`` sempre avance corretamente entre
-    páginas.
+    Observação: o mercado Steam trava ``pagesize`` em 10 mesmo autenticado
+    em algumas situações. Por isso o default é 10 e o avanço é de 10 em 10.
     """
     pagina_tamanho = max(1, min(pagina_tamanho, 10))
 
@@ -156,8 +170,8 @@ def listar_itens_populares(
             pagina,
             start,
         )
-        rate_limit(rate)
-        data = _get_json(sessao, SEARCH_URL, params)
+        await rate_limit_async(rate)
+        data = await _request_json(client, SEARCH_URL, params)
 
         resultados = data.get("results", []) if isinstance(data, dict) else []
         if not resultados:
@@ -187,13 +201,10 @@ def listar_itens_populares(
             if len(itens) >= limite:
                 break
 
-        # Critério principal: a Steam devolveu uma página incompleta
-        # (não há mais itens únicos além desse ponto). Isso protege contra
-        # total_count inflado (ex.: CS2 reporta 34k+ listagens somadas).
+        # Critério principal: página incompleta = fim do inventário.
         if len(resultados) < pagina_tamanho:
             break
 
-        # Salvaguarda: se total_count for menor do que já percorremos, parar.
         total = int(data.get("total_count", 0)) if isinstance(data, dict) else 0
         if total and start + pagina_tamanho >= total:
             break
@@ -204,18 +215,16 @@ def listar_itens_populares(
     return itens
 
 
-def obter_historico(
-    sessao: requests.Session,
+async def obter_historico(
+    client,
     appid: int,
     market_hash_name: str,
     *,
     currency: int = 986,
     rate: float = 1.0,
 ) -> pd.DataFrame:
-    """Baixa o histórico de preços de um item.
-
-    Retorna DataFrame com colunas: timestamp (datetime), preco (float),
-    volume (int). Vazio em caso de erro ou item sem histórico.
+    """Baixa o histórico de preços de um item. Retorna DataFrame vazio em
+    caso de erro ou item sem histórico.
     """
     params = {
         "appid": appid,
@@ -224,8 +233,8 @@ def obter_historico(
     }
     url = f"{BASE_URL}/pricehistory/"
     try:
-        rate_limit(rate)
-        data = _get_json(sessao, url, params)
+        await rate_limit_async(rate)
+        data = await _request_json(client, url, params)
     except MercadoError as exc:
         LOG.debug("Histórico indisponível para %s: %s", market_hash_name, exc)
         return pd.DataFrame(columns=["timestamp", "preco", "volume"])
@@ -247,8 +256,8 @@ def obter_historico(
     return df[["timestamp", "preco", "volume"]]
 
 
-def obter_preco_atual(
-    sessao: requests.Session,
+async def obter_preco_atual(
+    client,
     appid: int,
     market_hash_name: str,
     *,
@@ -264,8 +273,8 @@ def obter_preco_atual(
     }
     url = f"{BASE_URL}/priceoverview/"
     try:
-        rate_limit(rate)
-        data = _get_json(sessao, url, params)
+        await rate_limit_async(rate)
+        data = await _request_json(client, url, params)
     except MercadoError as exc:
         LOG.debug("Preço atual indisponível para %s: %s", market_hash_name, exc)
         return 0.0, 0.0
@@ -281,18 +290,18 @@ def gerar_url_listagem(appid: int, market_hash_name: str) -> str:
     return url_listing(appid, market_hash_name)
 
 
-def iterar_itens_para_analise(
-    sessao: requests.Session,
+async def iterar_itens_para_analise(
+    client,
     appid: int,
     *,
     limite: int = 1000,
     currency: int = 986,
-    pagina_tamanho: int = 100,
+    pagina_tamanho: int = 10,
     rate: float = 1.5,
-) -> Iterator[ItemPopular]:
+) -> AsyncIterator[ItemPopular]:
     """Yield cada ItemPopular coletado. Útil para pipelines."""
-    for item in listar_itens_populares(
-        sessao,
+    for item in await listar_itens_populares(
+        client,
         appid,
         limite=limite,
         currency=currency,

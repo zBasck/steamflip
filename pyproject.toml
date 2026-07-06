@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "steamflip"
 version = "0.1.0"
-description = "Analisador de oportunidades de compra e revenda no mercado Steam (Dota 2, CS2, TF2). Sem login, sem banco de dados, sem execução automática."
+description = "Analisador de oportunidades de compra e revenda no mercado Steam (Dota 2, CS2, TF2) usando login autenticado via pysteamauth."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,10 +28,11 @@ dependencies = [
     "numpy>=1.24",
     "requests>=2.31",
     "openpyxl>=3.1",
+    "pysteamauth>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "responses>=0.25"]
+dev = ["pytest>=7.4", "responses>=0.25", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 steamflip = "steamflip.main:cli"

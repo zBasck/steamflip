@@ -1,35 +1,33 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.eggs/
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
 dist/
+*.egg-info/
 *.egg
 
 # Ambientes virtuais
 .venv/
 venv/
 env/
+ENV/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-.DS_Store
-
-# Logs e saídas do bot
-*.log
-oportunidades_*.xlsx
-
-# Steam .maFile — contém credenciais 2FA, NUNCA comitar.
+# Credenciais Steam — NUNCA COMMITAR
 maFiles/
 *.maFile
 *.mafile
-mafile*.json
+config.py
 
-# Variáveis de ambiente e segredos
-.env
-.env.local
-secrets/
+# Saídas do bot
+oportunidades_*.xlsx
+*.xlsx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

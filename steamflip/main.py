@@ -1,16 +1,20 @@
-"""CLI: `python -m steamflip oportunidades --jogo dota2 cs2`."""
+"""CLI: `python -m steamflip oportunidades --jogo dota2 cs2`.
+
+Faz login com pysteamauth (username + senha + shared_secret do maFile)
+e roda a pipeline autenticada.
+"""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
-from typing import Iterable
 
 from . import __version__
-from .analise import analisar_item
 from .config import Criterios, Execucao, JOGOS
 from .main_pipeline import executar_pipeline
+from .mercado import MercadoError
 from .utils import configurar_logging
 
 LOG = logging.getLogger("steamflip")
@@ -21,8 +25,8 @@ def construir_parser() -> argparse.ArgumentParser:
         prog="steamflip",
         description=(
             "Analisador de oportunidades de revenda no mercado Steam. "
-            "Gera um Excel com link e preço-alvo por item. Use --mafile "
-            "para acesso autenticado (necessário para histórico de preços)."
+            "Faz login autenticado via pysteamauth (necessita maFile do "
+            "SDA com shared_secret) para destravar /pricehistory/."
         ),
     )
     parser.add_argument(
@@ -58,8 +62,8 @@ def construir_parser() -> argparse.ArgumentParser:
     p_op.add_argument(
         "--pagina-tamanho",
         type=int,
-        default=100,
-        help="Tamanho da página na busca pública (10-100).",
+        default=10,
+        help="Tamanho da página na busca (1-100, mercado trava em 10).",
     )
     p_op.add_argument(
         "--rate-limit",
@@ -103,16 +107,6 @@ def construir_parser() -> argparse.ArgumentParser:
     p_op.add_argument(
         "--verbose", "-v", action="store_true", help="Logs detalhados."
     )
-    p_op.add_argument(
-        "--mafile",
-        default=None,
-        help=(
-            "Caminho para um .maFile do SDA. Habilita o acesso autenticado ao "
-            "mercado (necessário para /pricehistory/ e /priceoverview/). "
-            "Se não informado, o bot roda sem login e esses endpoints podem "
-            "retornar HTTP 400."
-        ),
-    )
     return parser
 
 
@@ -134,15 +128,10 @@ def _args_para_execucao(args: argparse.Namespace) -> Execucao:
         ),
         saida=args.saida,
         verbose=args.verbose,
-        mafile_path=args.mafile,
     )
 
 
-def cli(argv: list[str] | None = None) -> int:
-    parser = construir_parser()
-    args = parser.parse_args(argv)
-    configurar_logging(verbose=getattr(args, "verbose", False))
-
+async def _async_cli(args: argparse.Namespace) -> int:
     if args.comando == "oportunidades":
         try:
             execucao = _args_para_execucao(args)
@@ -151,12 +140,22 @@ def cli(argv: list[str] | None = None) -> int:
             LOG.error(str(exc))
             return 2
 
-        caminho = executar_pipeline(execucao)
+        try:
+            caminho = await executar_pipeline(execucao)
+        except MercadoError as exc:
+            LOG.error("Falha no pipeline: %s", exc)
+            return 3
         LOG.info("Pronto. Arquivo: %s", caminho)
         return 0
 
-    parser.print_help()
     return 1
+
+
+def cli(argv: list[str] | None = None) -> int:
+    parser = construir_parser()
+    args = parser.parse_args(argv)
+    configurar_logging(verbose=getattr(args, "verbose", False))
+    return asyncio.run(_async_cli(args))
 
 
 if __name__ == "__main__":

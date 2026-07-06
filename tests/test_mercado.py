@@ -1,16 +1,19 @@
-"""Testes para a busca de itens populares (categoria + paginação)."""
+"""Testes para a busca de itens populares (categoria + paginação) na API
+assíncrona com pysteamauth.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from steamflip.mercado import (
-    ItemPopular,
-    MercadoError,
     _categorias_para_appid,
     listar_itens_populares,
+    obter_historico,
+    obter_preco_atual,
 )
 
 
@@ -45,148 +48,203 @@ class TestCategoriasParaAppid(unittest.TestCase):
         self.assertEqual(cats, {})
 
 
+def _client_mock_com_respostas(respostas: list) -> AsyncMock:
+    """Cria um cliente pysteamauth falso que devolve cada resposta em sequência."""
+    client = AsyncMock()
+
+    async def _request(url, method="GET", params=None):
+        return respostas.pop(0)
+
+    client.request.side_effect = _request
+    return client
+
+
 class TestListarItensPopulares(unittest.TestCase):
-    def _sessao_mock(self, paginas: list[dict]) -> MagicMock:
-        """Sessão mock que devolve cada página em sequência."""
-        sessao = MagicMock()
-        responses = []
-
-        class FakeResp:
-            def __init__(self, data: dict):
-                self._data = data
-                self.status_code = 200
-                self.text = json.dumps(data)
-
-            def json(self):
-                return self._data
-
-        for pagina in paginas:
-            responses.append(FakeResp(pagina))
-
-        sessao.get.side_effect = responses
-        return sessao
-
     def _patch_rate_limit(self):
-        return patch("steamflip.mercado.rate_limit", lambda *a, **kw: None)
+        return patch("steamflip.mercado.rate_limit_async", AsyncMock())
+
+    def _run(self, coro):
+        return asyncio.run(coro)
 
     def test_dota2_nao_envia_categorias_cs2(self):
-        """Para appid=570 os parâmetros category_730_* não devem ser enviados."""
         with self._patch_rate_limit():
-            sessao = self._sessao_mock([_resposta(total_count=10, n_resultados=10)])
-            listar_itens_populares(
-                sessao, 570, limite=100, pagina_tamanho=10, rate=0
+            client = _client_mock_com_respostas(
+                [_resposta(total_count=10, n_resultados=10)]
             )
-        chamada = sessao.get.call_args
+            self._run(
+                listar_itens_populares(client, 570, limite=100, pagina_tamanho=10, rate=0)
+            )
+        chamada = client.request.call_args
         params = chamada.kwargs.get("params") or chamada.args[1]
         self.assertEqual(params["appid"], 570)
         self.assertNotIn("category_730_ItemSet[]", params)
         self.assertNotIn("category_730_Tournament[]", params)
 
     def test_cs2_envia_categorias(self):
-        """Para appid=730 os parâmetros category_730_* devem ser enviados."""
         with self._patch_rate_limit():
-            sessao = self._sessao_mock([_resposta(total_count=10, n_resultados=10)])
-            listar_itens_populares(
-                sessao, 730, limite=100, pagina_tamanho=10, rate=0
+            client = _client_mock_com_respostas(
+                [_resposta(total_count=10, n_resultados=10)]
             )
-        chamada = sessao.get.call_args
+            self._run(
+                listar_itens_populares(client, 730, limite=100, pagina_tamanho=10, rate=0)
+            )
+        chamada = client.request.call_args
         params = chamada.kwargs.get("params") or chamada.args[1]
         self.assertEqual(params["appid"], 730)
         self.assertIn("category_730_ItemSet[]", params)
         self.assertIn("category_730_Tournament[]", params)
 
     def test_pagina_incompleta_para_loop(self):
-        """Página com menos itens que count deve parar o loop imediatamente."""
-        # Mesmo com total_count altíssimo (simulando CS2), uma página
-        # incompleta já é suficiente para encerrar a paginação.
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(
+            client = _client_mock_com_respostas(
                 [_resposta(total_count=99999, n_resultados=7)]
             )
-            itens = listar_itens_populares(
-                sessao, 730, limite=1000, pagina_tamanho=10, rate=0
+            itens = self._run(
+                listar_itens_populares(
+                    client, 730, limite=1000, pagina_tamanho=10, rate=0
+                )
             )
         self.assertEqual(len(itens), 7)
-        self.assertEqual(sessao.get.call_count, 1)
+        self.assertEqual(client.request.call_count, 1)
 
     def test_total_count_alto_nao_causa_loop_infinito(self):
-        """total_count inflado (CS2 reporta 34k+) não deve gerar paginação indefinida."""
-        # Simula 3 páginas cheias e uma incompleta — total_count gigante.
         paginas = [
             _resposta(total_count=99999, n_resultados=10),
             _resposta(total_count=99999, n_resultados=10),
             _resposta(total_count=99999, n_resultados=10),
-            _resposta(total_count=99999, n_resultados=4),  # última incompleta
+            _resposta(total_count=99999, n_resultados=4),
         ]
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(paginas)
-            itens = listar_itens_populares(
-                sessao, 730, limite=1000, pagina_tamanho=10, rate=0
+            client = _client_mock_com_respostas(paginas)
+            itens = self._run(
+                listar_itens_populares(
+                    client, 730, limite=1000, pagina_tamanho=10, rate=0
+                )
             )
-        # 3 páginas * 10 + 1 página * 4 = 34
         self.assertEqual(len(itens), 34)
-        # Garantia principal: paginação parou, não iterou até o total_count.
-        self.assertLessEqual(sessao.get.call_count, 4)
+        self.assertLessEqual(client.request.call_count, 4)
 
     def test_limite_respeitado(self):
-        """Respeita o limite máximo de itens mesmo se a página vier completa."""
-        # O mercado público trava em 10 sem login, então 5 páginas de 10
-        # cobrem o limite pedido de 50.
         paginas = [_resposta(total_count=500, n_resultados=10) for _ in range(5)]
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(paginas)
-            itens = listar_itens_populares(
-                sessao, 730, limite=50, pagina_tamanho=10, rate=0
+            client = _client_mock_com_respostas(paginas)
+            itens = self._run(
+                listar_itens_populares(
+                    client, 730, limite=50, pagina_tamanho=10, rate=0
+                )
             )
         self.assertEqual(len(itens), 50)
 
     def test_resposta_vazia_encerra(self):
-        """Lista vazia na resposta deve parar o loop sem erro."""
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(
+            client = _client_mock_com_respostas(
                 [_resposta(total_count=10, n_resultados=0)]
             )
-            itens = listar_itens_populares(
-                sessao, 730, limite=100, pagina_tamanho=10, rate=0
+            itens = self._run(
+                listar_itens_populares(
+                    client, 730, limite=100, pagina_tamanho=10, rate=0
+                )
             )
         self.assertEqual(len(itens), 0)
-        self.assertEqual(sessao.get.call_count, 1)
+        self.assertEqual(client.request.call_count, 1)
 
     def test_pagina_tamanho_forcado_para_max_10(self):
-        """A Steam trava pagesize=10 sem login; o cliente força o clamp."""
-        # 2 páginas de 10 são suficientes para validar o clamp.
         paginas = [
             _resposta(total_count=20, n_resultados=10),
-            _resposta(total_count=20, n_resultados=5),  # última, incompleta
+            _resposta(total_count=20, n_resultados=5),
         ]
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(paginas)
-            listar_itens_populares(
-                sessao, 730, limite=100, pagina_tamanho=100, rate=0
+            client = _client_mock_com_respostas(paginas)
+            self._run(
+                listar_itens_populares(
+                    client, 730, limite=100, pagina_tamanho=100, rate=0
+                )
             )
-        # Cada chamada deve ter count <= 10, mesmo o caller pedindo 100.
-        for c in sessao.get.call_args_list:
+        for c in client.request.call_args_list:
             params = c.kwargs.get("params") or c.args[1]
             self.assertLessEqual(int(params["count"]), 10)
 
     def test_paginacao_avanca_de_10_em_10(self):
-        """Steam retorna 10 por página; o start precisa avançar de 10 em 10."""
         paginas = [
             _resposta(total_count=99999, n_resultados=10),
             _resposta(total_count=99999, n_resultados=10),
-            _resposta(total_count=99999, n_resultados=3),  # fim
+            _resposta(total_count=99999, n_resultados=3),
         ]
         with self._patch_rate_limit():
-            sessao = self._sessao_mock(paginas)
-            listar_itens_populares(
-                sessao, 730, limite=100, pagina_tamanho=10, rate=0
+            client = _client_mock_com_respostas(paginas)
+            self._run(
+                listar_itens_populares(
+                    client, 730, limite=100, pagina_tamanho=10, rate=0
+                )
             )
-        # 3 chamadas de GET: starts esperados 0, 10, 20.
         starts = [
             (c.kwargs.get("params") or c.args[1])["start"]
-            for c in sessao.get.call_args_list
+            for c in client.request.call_args_list
         ]
         self.assertEqual(starts, [0, 10, 20])
+
+
+class TestObterHistorico(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_historico_valido(self):
+        client = _client_mock_com_respostas(
+            [
+                {
+                    "success": True,
+                    "prices": [
+                        ["Jul 01 2026 01: +0", "1,50", "10"],
+                        ["Jul 02 2026 01: +0", "1,40", "5"],
+                    ],
+                }
+            ]
+        )
+        with patch("steamflip.mercado.rate_limit_async", AsyncMock()):
+            df = self._run(obter_historico(client, 570, "X"))
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(df["preco"].iloc[0], 1.5)
+        self.assertEqual(int(df["volume"].iloc[1]), 5)
+
+    def test_historico_vazio_quando_success_false(self):
+        client = _client_mock_com_respostas([{"success": False}])
+        with patch("steamflip.mercado.rate_limit_async", AsyncMock()):
+            df = self._run(obter_historico(client, 570, "X"))
+        self.assertTrue(df.empty)
+
+    def test_historico_vazio_quando_erro(self):
+        client = AsyncMock()
+        client.request.side_effect = RuntimeError("boom")
+        with patch("steamflip.mercado.rate_limit_async", AsyncMock()):
+            df = self._run(obter_historico(client, 570, "X"))
+        self.assertTrue(df.empty)
+
+
+class TestObterPrecoAtual(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_preco_valido(self):
+        client = _client_mock_com_respostas(
+            [
+                {
+                    "success": True,
+                    "lowest_price": "R$ 1,99",
+                    "median_price": "R$ 2,10",
+                }
+            ]
+        )
+        with patch("steamflip.mercado.rate_limit_async", AsyncMock()):
+            lowest, median = self._run(obter_preco_atual(client, 570, "X"))
+        self.assertAlmostEqual(lowest, 1.99)
+        self.assertAlmostEqual(median, 2.10)
+
+    def test_preco_vazio_quando_erro(self):
+        client = AsyncMock()
+        client.request.side_effect = RuntimeError("boom")
+        with patch("steamflip.mercado.rate_limit_async", AsyncMock()):
+            lowest, median = self._run(obter_preco_atual(client, 570, "X"))
+        self.assertEqual((lowest, median), (0.0, 0.0))
 
 
 if __name__ == "__main__":
